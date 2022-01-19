@@ -1,0 +1,203 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  This blueprint creates infrastructure on AWS using Terraform.
+
+imports:
+  - types.yaml
+  - plugin:cloudify-smartupdate-plugin?version= >=2.0
+  - plugin:cloudify-terraform-plugin?version= >=0.15.0
+  - plugin:cloudify-utilities-plugin?version= >=1.22.1
+
+inputs:
+
+
+  agent_user:
+    description: >
+      The username of the agent running on the instance created from the image.
+    type: string
+    default: 'centos'
+
+  aws_region_name:
+    type: string
+    default: 'us-east-1'
+    constraints:
+      - valid_values:
+          - us-east-1
+          - us-east-2
+          - us-west-1
+          - us-west-2
+          - eu-central-1
+          - eu-west-1
+          - eu-west-2
+          - eu-south-1
+          - eu-west-3
+          - eu-north-1
+          - af-south-1
+          - ap-east-1
+          - ap-south-1
+          - ap-northeast-3
+          - ap-northeast-2
+          - ap-southeast-1
+          - ap-southeast-2
+          - ap-northeast-1
+          - ca-central-1
+          - cn-north-1
+          - cn-northwest-1
+          - me-south-1
+          - sa-east-1
+
+  agent_key_name:
+    type: string
+    default: agent_key
+
+  location:
+    type: string
+    default: https://github.com/cloudify-community/tf-source/archive/refs/heads/main.zip
+
+  source_path:
+    type: string
+    default: template/modules/public_vm
+
+  env_name:
+    type: string
+    default: 'example'
+
+
+node_types:
+  slack_notifier:
+    derived_from: cloudify.nodes.Root
+    properties:
+      slack_token:
+        type: string
+      channel_name:
+        type: string
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/send_notification.py
+          executor: central_deployment_agent
+          inputs:
+            slack_token:
+              default: { get_property: [ SELF, slack_token ] }
+            channel_name:
+              default: { get_property: [ SELF, channel_name ] }
+
+
+node_templates:
+
+  terraform:
+    type: cloudify.nodes.terraform
+
+  decision_breakpoint:
+    type: slack_notifier
+    properties:
+      slack_token: { get_secret: slack_token }
+      channel_name: { get_secret: slack_channel }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        start: {}
+
+  cloud_resources:
+    type: cloudify.nodes.terraform.Module
+    properties:
+      resource_config: &terraform_resource
+        source:
+          location: { get_input: location }
+        source_path: { get_input: source_path }
+        variables:
+          env_name: { get_input: env_name }
+          access_key: { get_secret: aws_access_key_id }
+          secret_key: { get_secret: aws_secret_access_key }
+          aws_region: { get_input: aws_region_name }
+          aws_zone: { concat: [ { get_input: aws_region_name }, 'a' ] }
+          admin_user: { get_input: agent_user }
+          admin_key_public: { get_attribute: [agent_key, public_key_export] }
+      general_executor_process:
+        max_sleep_time: 900
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: tf.cloudify_tf.tasks.plan
+        start: tf.cloudify_tf.tasks.apply
+
+      cloudify.interfaces.smart_update.preupdate:
+        stop:
+          implementation: tf.cloudify_tf.tasks.plan
+          inputs: *terraform_resource
+
+      cloudify.interfaces.smart_update.update:
+        update: {}
+
+      cloudify.interfaces.smart_update.postupdate:
+        start:
+          implementation: tf.cloudify_tf.tasks.reload_template
+          inputs: *terraform_resource
+
+
+    relationships:
+      - target: terraform
+        type: cloudify.terraform.relationships.run_on_host
+      - target: agent_key
+        type: cloudify.relationships.depends_on
+
+      - type: cloudify.relationships.smart_update.depends_on
+        target: decision_breakpoint
+        target_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            postconfigure:
+              implementation: scripts/wait_slack_action.py
+              executor: central_deployment_agent
+              inputs:
+                slack_token: { get_property: [ TARGET, slack_token ] }
+                channel_id: { get_secret: slack_channel_id }
+          cloudify.interfaces.relationship_update:
+            update:
+              implementation: scripts/send_notification.py
+              executor: central_deployment_agent
+              inputs:
+                slack_token: { get_property: [ TARGET, slack_token ] }
+                channel_name: { get_property: [ TARGET, channel_name ] }
+          cloudify.interfaces.relationship_postupdate:
+            preconfigure:
+              implementation: scripts/wait_slack_action.py
+              executor: central_deployment_agent
+              inputs:
+                slack_token: { get_property: [ TARGET, slack_token ] }
+                channel_id: { get_secret: slack_channel_id }
+        source_interfaces:
+          cloudify.interfaces.relationship_update:
+            update: {}
+
+
+
+
+  agent_key:
+    type: cloudify.keys.nodes.RSAKey
+    properties:
+      resource_config:
+        key_name: { get_input: agent_key_name }
+        openssh_format: true
+      use_secret_store: true
+      use_secrets_if_exist: true
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: keys.cloudify_ssh_key.operations.create
+          inputs:
+            store_private_key_material: true
+
+capabilities:
+  name:
+    value: { get_attribute: [ cloud_resources, resources, example_vm, instances, 0, attributes, tags, Name ] }
+
+  endpoint:
+    description: The external endpoint of the application.
+    value: { get_attribute: [ cloud_resources, resources, eip, instances, 0, attributes, public_ip ] }
+
+  user:
+    description: user ID.
+    value: { get_input: agent_user }
+
+  key_content:
+    description: Private agent key
+    value: { get_attribute: [agent_key, private_key_export] }

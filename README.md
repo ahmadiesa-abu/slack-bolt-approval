@@ -22,3 +22,15 @@ before running the app , you need to export 2 environment variables that matches
 # export SLACK_SIGNING_SECRET=***
 # export SLACK_BOT_TOKEN=xoxb-***
 ```
+
+inside blueprint is a simple blueprint that creates the message on a specific channel to ask for user approval
+
+5 secrets need to be configured on Cloudify to run it
+
+```
+slack_token
+slack_channel
+slack_channel_id
+aws_access_key_id
+aws_secret_access_key
+```
